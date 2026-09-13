@@ -1,9 +1,20 @@
 import os
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from utils import deduplicate_results, calculate_match_score, clean_text
 
+def get_robust_session():
+    """Creates a network session that automatically retries failed requests."""
+    session = requests.Session()
+    # Retry up to 3 times if the network drops or times out
+    retry = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
+
 def generate_queries(profile: dict) -> list:
-    """Dynamically generates a lean set of search queries based on the user's profile."""
     field = profile.get("field", "Software")
     location = profile.get("location", "Pakistan")
     skills = " ".join(profile.get("skills", [])[:2])
@@ -11,20 +22,17 @@ def generate_queries(profile: dict) -> list:
     if location.lower() == "any":
         location = "Pakistan OR Remote"
 
-    # Reduced from 6 queries to 3 queries to prevent SerpAPI timeouts on free tier
     queries = [
         f"{field} internship {location} {skills}",
         f"junior {field} jobs {location} {skills}",
         f"{skills} training course Pakistan"
     ]
-    
     return queries
 
 def search_web(query: str) -> list:
-    """Executes a web search. Uses SerpAPI Google Search REST API."""
     api_key = os.environ.get("SEARCH_API_KEY")
     if not api_key:
-        print("Warning: SEARCH_API_KEY missing. Returning empty results.")
+        print("Warning: SEARCH_API_KEY missing.")
         return []
 
     params = {
@@ -35,14 +43,15 @@ def search_web(query: str) -> list:
         "gl": "pk", 
     }
     
+    session = get_robust_session()
+    
     try:
-        # Added a larger 45-second read timeout for slower connections
-        response = requests.get("https://serpapi.com/search", params=params, timeout=(10, 45))
+        # Using a generous 45-second timeout for unstable connections
+        response = session.get("https://serpapi.com/search", params=params, timeout=(15, 45))
         response.raise_for_status()
         data = response.json()
         
         results = []
-        
         for item in data.get("organic_results", []):
             results.append({
                 "title": clean_text(item.get("title")),
@@ -60,7 +69,6 @@ def search_web(query: str) -> list:
         return []
 
 def collect_opportunities(profile: dict) -> list:
-    """Main pipeline to generate queries, fetch, clean, and filter results."""
     queries = generate_queries(profile)
     all_results = []
     
@@ -68,11 +76,10 @@ def collect_opportunities(profile: dict) -> list:
         all_results.extend(search_web(q))
         
     unique_results = deduplicate_results(all_results)
-    
     user_skills = profile.get("skills", [])
+    
     for res in unique_results:
         res["basic_score"] = calculate_match_score(user_skills, res["description"], res["title"])
-        
         text = f"{res['title']} {res['description']}".lower()
         if "intern" in text:
             res["type"] = "Internship"
